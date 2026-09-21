@@ -129,3 +129,107 @@ Zusätzlich üblich, aber nicht ladelogik-relevant, eher für den Hub-Viewer/Dis
 **Wichtig:** Das früher genutzte `dataset_infos.json` als separate Datei ist mittlerweile **deprecated/legacy** – bei aktuellen Datasets ist alles ins README-YAML gewandert. Für maximale Kompatibilität solltest du dich also rein auf README.md-YAML (`configs` + `dataset_info`) plus Parquet-Dateien stützen, ganz ohne separates JSON und ohne Loading-Script (`.py`-Dateien sind ebenfalls veraltet).
 
 Möchtest du, dass ich dir ein konkretes Vorlagen-Template (README.md + Ordnerstruktur) für dein spezifisches Dataset erstelle?
+
+Gute Frage – die Antwort: **Nein, es gibt keine eingebaute Split-Spalte pro Zeile.** Die Zugehörigkeit zu einem Split wird rein über die **Datei** bestimmt, nicht über ein Feld im Sample selbst.
+
+## Split-Zugehörigkeit = Dateizuordnung, nicht Zeileninhalt
+
+Wenn eine Zeile in `train-00000-of-00001.parquet` liegt, ist sie automatisch Teil des `train`-Splits. Es gibt standardmäßig **kein** `split`-Feld, **kein** automatisches `id`/`idx`-Feld und **keine** Subset-Kennung im Sample selbst – außer du fügst sowas explizit als eigene Spalte in deine Daten ein.
+
+Einzige Ausnahme: Bei bild-/audio-basierten Ordnerstrukturen (Klassifikation) wird der Ordnername automatisch als `label`-Spalte in jede Zeile geschrieben (kannst du mit `drop_labels: true` abschalten) – das ist aber Sonderfall, kein generelles Prinzip.
+
+## Was pro Sample tatsächlich gespeichert wird
+
+Nur die Feature-Spalten, wie sie im Schema definiert sind (bei Parquet: die Parquet-Columns selbst). Für dein Beispiel `sentence1`, `sentence2`, `label` – jede Zeile enthält exakt diese Werte, nichts weiter.
+
+## Aber: Es gibt Metadaten auf Dateiebene (Parquet-Footer)
+
+Hier wird's interessant: `datasets` schreibt beim Konvertieren zu Parquet das komplette Feature-Schema als **Key-Value-Metadata in den Parquet-Footer** der jeweiligen Datei – unter dem Key `"huggingface"`. Das sieht z. B. so aus:
+
+```python
+import pyarrow.parquet as pq
+metadata = pq.read_metadata("train-00000-of-00001.parquet")
+json.loads(metadata.metadata[b"huggingface"])
+# {'info': {'features': {'sentence1': {'dtype': 'string', '_type': 'Value'},
+#                         'label': {'names': ['entailment', 'not_entailment'],
+#                                   '_type': 'ClassLabel'}}}}
+```
+
+Das ist **Datei-Metadaten**, nicht Zeilen-Metadaten – aber es ist der Mechanismus, mit dem `datasets` beim Laden prüft, ob das Schema zur README-YAML-Deklaration (`dataset_info.features`) passt. Passt es nicht überein, gibt's genau den `CastError`, den man häufig im Dataset Viewer sieht, wenn Spaltennamen nicht übereinstimmen.
+
+## Zusammenfassung
+
+| Ebene | Was steht da |
+|---|---|
+| **Zeile/Sample** | Nur die Feature-Werte selbst (keine Split-/Subset-Info) |
+| **Datei** (Parquet-Footer, `huggingface`-Key) | Feature-Schema (Typen, ClassLabel-Namen etc.) |
+| **Dateiname/Pfad** | Bestimmt Split-Zugehörigkeit (per Konvention oder YAML `data_files`) |
+| **README.md YAML** (`configs.data_files`) | Explizite Zuordnung Datei → Split, Datei → Subset |
+| **README.md YAML** (`dataset_info`) | Erwartetes Schema + Statistiken (Soll-Zustand zum Abgleich) |
+
+Für dein eigenes kompatibles Format heißt das praktisch: Du musst pro Zeile **nichts extra** speichern – du musst nur konsequent sein bei **Dateibenennung/-ablage** (welche Datei = welcher Split/Subset) und das im README-YAML korrekt deklarieren. Willst du, dass ich dir zeige, wie du beim Schreiben mit `datasets.Dataset.to_parquet()` oder `push_to_hub()` dieses Footer-Schema automatisch mitgeneriert bekommst, statt es manuell zu pflegen?
+
+Wichtige Unterscheidung zuerst: Es gibt zwei völlig unterschiedliche "Arrow"-Kontexte bei `datasets`, und das solltest du bei deinem Nachbau nicht verwechseln.
+
+## 1. Wie Audio überhaupt strukturell gespeichert wird (unabhängig von Arrow vs. Parquet)
+
+Die `Audio`-Feature ist intern als **Struct-Spalte** definiert:
+
+```python
+pa_type = pa.struct({"bytes": pa.binary(), "path": pa.string()})
+```
+
+Jedes Audio-Sample ist also **eine Zelle** in der Tabelle mit zwei Unterfeldern:
+- `bytes`: die rohen Audiodaten (z. B. WAV/MP3-Bytes) direkt eingebettet, binär
+- `path`: optionaler Dateiname/Pfad (z. B. `"clip_0001.wav"`), rein informativ
+
+Das gilt **gleichermaßen** in Arrow- und in Parquet-Dateien, weil ein Arrow-Struct 1:1 auf einen Parquet-Struct-Type abbildet. Die Audiodaten liegen also direkt **in der Tabelle**, nicht als separate Dateien daneben – es sei denn, du entscheidest dich bewusst für externe Referenzierung (dann ist `bytes` null und nur `path` gesetzt, was aber offline nicht ladbar ist ohne die referenzierten Dateien).
+
+## 2. `.arrow`-Dateien = lokales Cache-Format, NICHT das Hub-Upload-Format
+
+Wenn du lokal `dataset.save_to_disk("mein_pfad")` aufrufst, entsteht eine völlig andere Struktur als beim Hub-Upload:
+
+```
+mein_pfad/
+├── dataset_dict.json          # listet die Splits
+├── train/
+│   ├── dataset_info.json      # Features, Beschreibung, Split-Infos
+│   ├── state.json             # welche .arrow-Dateien, Fingerprint
+│   └── data-00000-of-00001.arrow
+└── test/
+    ├── dataset_info.json
+    ├── state.json
+    └── data-00000-of-00001.arrow
+```
+
+Das ist das **Arrow-IPC/Feather-Format**, optimiert für schnelles Memory-Mapping lokal – nicht für Web-Hosting gedacht.
+
+## 3. Wichtig: `push_to_hub()` konvertiert IMMER zu Parquet
+
+Wenn du ein Dataset via `push_to_hub()` hochlädst, wandelt `datasets` die Arrow-Tabellen **automatisch in Parquet** um. Auf dem Hub selbst liegen so gut wie nie `.arrow`-Dateien – der Standard ist Parquet (wie in meiner vorherigen Antwort beschrieben), auch für Audio/Bild-Datensätze. Der Struct mit `bytes`+`path` wandert einfach unverändert in die Parquet-Spalte.
+
+## 4. Kannst du trotzdem `.arrow`-Dateien auf dem Hub hosten?
+
+Ja, technisch geht das – `datasets` hat auch einen Arrow-Loader (`packaged_modules/arrow`), analog zu CSV/JSON/Parquet. Du könntest in der README-YAML einfach auf `.arrow`-Dateien verweisen:
+
+```yaml
+configs:
+  - config_name: default
+    data_files:
+      - split: train
+        path: "data/train-*.arrow"
+```
+
+Aber: Das ist unüblich, wird vom Dataset Viewer schlechter unterstützt (kein Streaming-Vorteil wie bei Parquet, größere Dateien, keine Kompression), und **kein einziges** offizielles HF-Dataset macht das so. Für "genauso wie die Open-Source-Datasets" solltest du also bei **Parquet** bleiben.
+
+## Zusammenfassung
+
+| Frage | Antwort |
+|---|---|
+| Wo liegen Audio-Bytes? | Direkt als `bytes`-Feld im Struct, in derselben Zeile/Tabelle |
+| Braucht's separate Audiodateien neben der Tabelle? | Nein, wenn `bytes` gesetzt ist – alles ist eingebettet |
+| Ist `.arrow` das Hub-Format? | Nein – `.arrow` ist lokales Cache-Format (`save_to_disk`), Hub nutzt Parquet |
+| Metadaten bei `.arrow`? | `dataset_info.json` + `state.json` pro Split, `dataset_dict.json` auf oberster Ebene |
+| Soll ich für Hub-Kompatibilität `.arrow` nutzen? | Nein, konvertiere zu Parquet (z. B. via `push_to_hub()` oder `to_parquet()`) |
+
+Willst du, dass ich dir zeige, wie du ein bestehendes Audio-Dataset (z. B. Ordner mit `.wav`-Dateien + Metadaten-CSV) direkt in dieses Struct-Format packst und als Parquet exportierst?
